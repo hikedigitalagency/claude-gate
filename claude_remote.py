@@ -137,39 +137,38 @@ def clear_all_flags():
 
 def ask_terminal(project: str, tool: str, detail: str):
     """
-    macOS native dialog — Claude Code ke saath best compatible.
-    /dev/tty hook subprocess mein kaam nahi karta (TUI limitation).
+    macOS native dialog via temp applescript file.
     Returns: 'yes' | 'all' | 'no' | ('instruct', text) | None
     """
     try:
-        safe_msg = (project + chr(10) + 'Tool: ' + detail[:120]).replace('"', "'")
+        import tempfile
+        msg = (project + "\n" + detail[:100]).replace('"', "'")
+        # AppleScript string: newlines ko return se join karo
+        as_str = " & return & ".join(f'"{p}"' for p in msg.split("\n"))
         script = (
-            'tell application "System Events" to set frontApp to name of first process whose frontmost is true' + chr(10) +
-            'with timeout ' + str(TTY_TIMEOUT) + ' seconds' + chr(10) +
-            '  tell application frontApp to activate' + chr(10) +
-            '  set result to display dialog "' + safe_msg + '" ' +
-            'with title "Claude Approval (' + str(TTY_TIMEOUT) + 's)" ' +
-            'default answer "" ' +
-            'buttons {"No", "Yes All", "Yes"} ' +
-            'default button "Yes")' + chr(10) +
-            '  set btn to button returned of result' + chr(10) +
-            '  set txt to text returned of result' + chr(10) +
-            'end timeout' + chr(10) +
-            'return btn & "|" & txt'
+            f"set dlg to display dialog {as_str} "
+            f'with title "Claude Approval" default answer "" '
+            f'buttons {{"No", "Yes All", "Yes"}} default button "Yes"\n'
+            f'return (button returned of dlg) & "|" & (text returned of dlg)'
         )
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".applescript", delete=False) as f:
+            f.write(script)
+            tmp = f.name
         r = subprocess.run(
-            ["osascript", "-e", script],
+            ["osascript", tmp],
             capture_output=True, text=True, timeout=TTY_TIMEOUT + 3
         )
-        out  = r.stdout.strip()
+        os.unlink(tmp)
+        if r.returncode != 0:
+            return None
+        out   = r.stdout.strip()
         parts = out.split("|", 1)
-        btn  = parts[0].strip()
-        txt  = parts[1].strip() if len(parts) > 1 else ""
-
+        btn   = parts[0].strip()
+        txt   = parts[1].strip() if len(parts) > 1 else ""
         if btn == "No":      return "no"
         if btn == "Yes All": return "all"
         if btn == "Yes":
-            if txt:           return ("instruct", txt)
+            if txt:          return ("instruct", txt)
             return "yes"
     except Exception:
         pass
@@ -599,6 +598,7 @@ def run_broker():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_hook():
+    open("/tmp/hook_fired.log", "a").write("hook fired\n")
     try:
         hook_data = json.load(sys.stdin)
     except Exception:
