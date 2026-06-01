@@ -137,30 +137,40 @@ def clear_all_flags():
 
 def ask_terminal(project: str, tool: str, detail: str):
     """
-    macOS native dialog — foreground mein, pehle Claude Code window ke upar.
-    Returns: 'yes' | 'all' | 'no' | None (timeout/close)
+    macOS native dialog — Claude Code ke saath best compatible.
+    /dev/tty hook subprocess mein kaam nahi karta (TUI limitation).
+    Returns: 'yes' | 'all' | 'no' | ('instruct', text) | None
     """
     try:
-        safe_msg = (project + chr(10) + 'Tool: ' + tool + chr(10) + detail[:120]).replace('"', "'")
+        safe_msg = (project + chr(10) + 'Tool: ' + detail[:120]).replace('"', "'")
         script = (
             'tell application "System Events" to set frontApp to name of first process whose frontmost is true' + chr(10) +
             'with timeout ' + str(TTY_TIMEOUT) + ' seconds' + chr(10) +
             '  tell application frontApp to activate' + chr(10) +
-            '  set btn to button returned of (display dialog "' + safe_msg + '" ' +
+            '  set result to display dialog "' + safe_msg + '" ' +
             'with title "Claude Approval (' + str(TTY_TIMEOUT) + 's)" ' +
+            'default answer "" ' +
             'buttons {"No", "Yes All", "Yes"} ' +
             'default button "Yes")' + chr(10) +
+            '  set btn to button returned of result' + chr(10) +
+            '  set txt to text returned of result' + chr(10) +
             'end timeout' + chr(10) +
-            'return btn'
+            'return btn & "|" & txt'
         )
         r = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, text=True, timeout=TTY_TIMEOUT + 3
         )
-        btn = r.stdout.strip()
-        if btn == "Yes":     return "yes"
-        if btn == "Yes All": return "all"
+        out  = r.stdout.strip()
+        parts = out.split("|", 1)
+        btn  = parts[0].strip()
+        txt  = parts[1].strip() if len(parts) > 1 else ""
+
         if btn == "No":      return "no"
+        if btn == "Yes All": return "all"
+        if btn == "Yes":
+            if txt:           return ("instruct", txt)
+            return "yes"
     except Exception:
         pass
     return None
@@ -203,11 +213,16 @@ class TelegramBot:
             "chat_id":    self.chat_id,
             "text":       text,
             "parse_mode": "Markdown",
-            "reply_markup": {"inline_keyboard": [[
-                {"text": "✅ Yes",              "callback_data": f"yes:{req_id}"},
-                {"text": "✅ Yes All (session)", "callback_data": f"all:{req_id}"},
-                {"text": "❌ No",               "callback_data": f"no:{req_id}"},
-            ]]}
+            "reply_markup": {"inline_keyboard": [
+                [
+                    {"text": "✅ Yes",              "callback_data": f"yes:{req_id}"},
+                    {"text": "✅ Yes All (session)", "callback_data": f"all:{req_id}"},
+                    {"text": "❌ No",               "callback_data": f"no:{req_id}"},
+                ],
+                [
+                    {"text": "✏️ Instruct", "callback_data": f"instruct:{req_id}"},
+                ],
+            ]}
         })
         return r.get("result", {}).get("message_id", 0)
 
@@ -225,6 +240,55 @@ class TelegramBot:
                 self._last_update_id = u["update_id"]
         except Exception:
             pass
+
+    def send_instruction_prompt(self, req_id: str, orig_msg_id: int) -> int:
+        """Instruct button tap ke baad instruction maango"""
+        # Edit original message buttons to show waiting state
+        try:
+            self._post("editMessageReplyMarkup", {
+                "chat_id": self.chat_id,
+                "message_id": orig_msg_id,
+                "reply_markup": {"inline_keyboard": [[
+                    {"text": "⏳ Waiting for instruction...", "callback_data": "done"}
+                ]]}
+            })
+        except Exception:
+            pass
+        # Send force_reply message
+        r = self._post("sendMessage", {
+            "chat_id": self.chat_id,
+            "text": f"✏️ *Type your instruction for Claude:*\n_(Reply to cancel: send `-`)_",
+            "parse_mode": "Markdown",
+            "reply_markup": {"force_reply": True, "selective": False}
+        })
+        return r.get("result", {}).get("message_id", 0)
+
+    def poll_messages(self) -> list:
+        """
+        Naye text message updates fetch karo (non-callback).
+        Returns list of message text strings.
+        """
+        params = "timeout=0"
+        if self._last_update_id:
+            params += f"&offset={self._last_update_id + 1}"
+
+        try:
+            data = self._get("getUpdates", params)
+        except Exception as e:
+            logging.error(f"poll_messages getUpdates error: {e}")
+            return []
+
+        results = []
+        for u in data.get("result", []):
+            uid = u["update_id"]
+            self._last_update_id = uid
+            msg = u.get("message")
+            if not msg:
+                continue
+            text = msg.get("text", "")
+            if text and not text.startswith("/"):
+                results.append(text)
+        return results
 
     def poll_callbacks(self) -> list:
         """
@@ -250,7 +314,12 @@ class TelegramBot:
             self._last_update_id = uid
             cb = u.get("callback_query")
             if not cb:
-                logging.info(f"  update {uid}: message (skip)")
+                msg_text = u.get("message", {}).get("text", "").strip()
+                if msg_text and not msg_text.startswith("/"):
+                    logging.info(f"  update {uid}: message text={msg_text[:40]}")
+                    results.append(("__msg__", msg_text, 0))
+                else:
+                    logging.info(f"  update {uid}: message (skip)")
                 continue
             cb_data = cb["data"]
             logging.info(f"  update {uid}: CALLBACK data={cb_data}")
@@ -264,6 +333,18 @@ class TelegramBot:
             parts = cb_data.split(":", 1)
             if len(parts) == 2:
                 decision, req_id = parts
+                if decision == "instruct":
+                    # Answer with prompt hint
+                    try:
+                        self._post("answerCallbackQuery", {
+                            "callback_query_id": cb["id"],
+                            "text": "Type your instruction ✏️",
+                            "show_alert": False,
+                        })
+                    except Exception:
+                        pass
+                    results.append((req_id, "instruct", cb.get("message", {}).get("message_id", 0)))
+                    continue
                 # Toast popup + message edit karo (clear visual feedback)
                 try:
                     label = "Approved ✅" if decision != "no" else "Denied ❌"
@@ -345,6 +426,9 @@ def run_broker():
     if pending:
         logging.info(f"Recovered {len(pending)} pending requests")
 
+    # req_id → {**info, "prompt_msg_id": int, "sent_at": float}
+    waiting_instruction: dict = {}
+
     def handle_decision(req_id: str, decision: str, session_id: str, source: str):
         resp_file = RESP_DIR / f"resp-{req_id}.json"
         if decision == "all":
@@ -402,8 +486,35 @@ def run_broker():
                 req_file.unlink(missing_ok=True)
 
             # ── 2. Telegram callbacks ────────────────────────────────────────
-            if pending:
+            if pending or waiting_instruction:
                 for req_id, decision, msg_id in bot.poll_callbacks():
+                    # Text message reply (instruction)
+                    if req_id == "__msg__":
+                        text = decision
+                        if waiting_instruction:
+                            wi_req_id = next(iter(waiting_instruction))
+                            info = waiting_instruction.pop(wi_req_id)
+                            resp_file = RESP_DIR / f"resp-{wi_req_id}.json"
+                            if text.strip() == "-":
+                                resp_file.write_text(json.dumps({"decision": "block", "reason": "User cancelled"}))
+                                logging.info(f"[instruction] CANCELLED  {wi_req_id}")
+                            else:
+                                resp_file.write_text(json.dumps({"decision": "block", "reason": text}))
+                                logging.info(f"[instruction] SENT  {wi_req_id}  text={text[:40]}")
+                            try:
+                                bot.send_text("✅ Claude ko instruction di gayi: " + text)
+                            except Exception:
+                                pass
+                        continue
+                    if decision == "instruct":
+                        if req_id not in pending:
+                            continue
+                        info = pending.pop(req_id)
+                        save_pending(pending)
+                        prompt_msg_id = bot.send_instruction_prompt(req_id, msg_id or info.get("msg_id", 0))
+                        waiting_instruction[req_id] = {**info, "prompt_msg_id": prompt_msg_id, "sent_at": time.time()}
+                        logging.info(f"[telegram] INSTRUCT  {req_id}  waiting for text reply")
+                        continue
                     if req_id not in pending:
                         continue
                     info = pending.pop(req_id)
@@ -422,6 +533,49 @@ def run_broker():
                         })
                     except Exception:
                         pass
+
+            # ── 2.5 Instruction text replies ─────────────────────────────────
+            if waiting_instruction:
+                # Check timeouts first
+                for req_id in list(waiting_instruction):
+                    info = waiting_instruction[req_id]
+                    if time.time() - info.get("sent_at", 0) > TG_TIMEOUT:
+                        waiting_instruction.pop(req_id)
+                        handle_decision(req_id, "no", info["session_id"], "instruction-timeout")
+                        logging.info(f"[instruction-timeout]  {req_id}")
+                        continue
+
+                # Poll for text message replies
+                text_msgs = bot.poll_messages()
+                for text in text_msgs:
+                    if not waiting_instruction:
+                        break
+                    # FIFO: take first pending req_id
+                    req_id = next(iter(waiting_instruction))
+                    info = waiting_instruction.pop(req_id)
+                    resp_file = RESP_DIR / f"resp-{req_id}.json"
+                    if text.strip() == "-":
+                        # Cancel → block with no reason
+                        resp_file.write_text(json.dumps({"decision": "block", "reason": "Instruction cancelled"}))
+                        logging.info(f"[instruction-cancel]  {req_id}")
+                        try:
+                            bot._post("sendMessage", {
+                                "chat_id": bot.chat_id,
+                                "text": "❌ Instruction cancelled.",
+                            })
+                        except Exception:
+                            pass
+                    else:
+                        instruction_text = text.strip()
+                        resp_file.write_text(json.dumps({"decision": "block", "reason": f"User instruction: {instruction_text}"}))
+                        logging.info(f"[instruction]  {req_id}  text={instruction_text[:60]}")
+                        try:
+                            bot._post("sendMessage", {
+                                "chat_id": bot.chat_id,
+                                "text": f"✅ Instruction sent: {instruction_text}",
+                            })
+                        except Exception:
+                            pass
 
             # ── 3. Timeouts ──────────────────────────────────────────────────
             now = time.time()
@@ -486,6 +640,9 @@ def run_hook():
 
     # Laptop pe ho? Terminal pe seedha puchho (10s timeout)
     ans = ask_terminal(get_project_identity(), tool_name, detail)
+    if isinstance(ans, tuple) and ans[0] == "instruct":
+        print(json.dumps({"decision": "block", "reason": ans[1]}))
+        return
     if ans == "all":
         set_yes_all(session_id)
         print(json.dumps({"decision": "approve"}))
